@@ -11,7 +11,7 @@
 // and a reference to this page. The display's page drops both as it loads
 // (`standAlone`): it claims nothing and is let in by the login cookie alone. The
 // reference is made again each time the tab is found, and dropped here then.
-import { GATEWAY_ORIGIN, gatewayUrl } from "./gateway.ts";
+import { GATEWAY_ORIGIN, gatewayPath, gatewayUrl } from "./gateway.ts";
 
 /** The page of the display shown in tab `tab`. */
 export function displayTabUrl(tab: number): string {
@@ -50,7 +50,8 @@ export function showDisplayTab(
   try {
     there =
       shown.location.origin === GATEWAY_ORIGIN &&
-      shown.location.pathname.replace(/\/$/, "") === `/display/${tab}`;
+      shown.location.pathname.replace(/\/$/, "") ===
+        gatewayPath(`/display/${tab}`).replace(/\/$/, "");
   } catch {
     // The tab was since taken to another site, whose address is not ours to read.
   }

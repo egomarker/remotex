@@ -7,6 +7,7 @@ pub mod aac_eld;
 pub mod assets;
 pub mod audio;
 pub mod auth;
+pub(crate) mod base_path;
 pub mod camera;
 pub mod cli;
 pub mod config;

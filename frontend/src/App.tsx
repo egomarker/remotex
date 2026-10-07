@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { standAlone } from "./displayTab.ts";
-import { gatewayFetch, gatewayUrl } from "./gateway.ts";
+import { gatewayFetch, gatewayRoute, gatewayUrl } from "./gateway.ts";
 import { gatewayConfig } from "./gatewayConfig.ts";
 import Login from "./Login.tsx";
 import RemoteDesktop from "./RemoteDesktop.tsx";
@@ -14,7 +14,9 @@ function tabDisplayOf(path: string): number | null {
   return /^\/display\/2\/?$/.test(path) ? 2 : null;
 }
 
-const TAB_DISPLAY = tabDisplayOf(globalThis.location?.pathname ?? "/");
+const TAB_DISPLAY = tabDisplayOf(
+  gatewayRoute(globalThis.location?.pathname ?? "/") ?? "/",
+);
 
 // A display's tab opened from the session's page starts with a copy of that
 // page's storage (displayTab.ts). What is the session's goes before anything

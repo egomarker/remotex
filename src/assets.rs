@@ -23,6 +23,11 @@
 //! the names it was built with, which the page's decode worker and the decoder's
 //! threads import the glue by. Without it `/hevc/` is a 404 and the
 //! page, which asks for the decoder before choosing it, decodes as it did before.
+//!
+//! A reverse proxy may publish all of that under another path. It strips that
+//! path before forwarding and sends it as `X-Forwarded-Prefix`; the document's
+//! `<base>` is rewritten to the validated prefix so its bundle, workers, API,
+//! sockets, and decoder stay under the same mount.
 
 use std::fmt::Write as _;
 
@@ -33,14 +38,16 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use rust_embed::{EmbeddedFile, RustEmbed};
+use sha2::{Digest as _, Sha256};
 
-use crate::hevc_wasm::HevcDecoder;
+use crate::{base_path, hevc_wasm::HevcDecoder};
 
 #[derive(RustEmbed)]
 #[folder = "$OUT_DIR/frontend-dist"]
 struct Frontend;
 
 const INDEX: &str = "index.html";
+const BASE_HREF: &[u8] = b"<base href=\"/\"";
 
 /// The document. Its presence is `build.rs`'s promise: the build fails without
 /// `index.html`, so there is no gateway in which this is `None`.
@@ -58,6 +65,9 @@ pub fn serve(decoder: Option<&HevcDecoder>, request: &Request) -> Response {
     if !matches!(*request.method(), Method::GET | Method::HEAD) {
         return StatusCode::METHOD_NOT_ALLOWED.into_response();
     }
+    let Ok(prefix) = base_path::forwarded_prefix(request.headers()) else {
+        return (StatusCode::BAD_REQUEST, "invalid x-forwarded-prefix\n").into_response();
+    };
     let path = request.uri().path().trim_start_matches('/');
     let (body, content_type, etag) = if let Some(name) = path.strip_prefix("hevc/") {
         // Not the page: the decoder is looked for here, and a 200 with the
@@ -70,13 +80,17 @@ pub fn serve(decoder: Option<&HevcDecoder>, request: &Request) -> Response {
             HeaderValue::from_static(mime),
             quoted(&file.sha256),
         )
-    } else {
-        let file = match Frontend::get(path) {
-            Some(file) if !path.is_empty() => file,
-            _ => index(),
-        };
+    } else if let Some(file) = Frontend::get(path).filter(|_| !path.is_empty() && path != INDEX) {
         let (content_type, etag) = (content_type(&file), etag(&file));
         (Body::from(file.data), content_type, etag)
+    } else {
+        let document = document(prefix);
+        let etag = bytes_etag(&document);
+        (
+            Body::from(document),
+            HeaderValue::from_static("text/html; charset=utf-8"),
+            etag,
+        )
     };
 
     if request
@@ -88,6 +102,24 @@ pub fn serve(decoder: Option<&HevcDecoder>, request: &Request) -> Response {
     } else {
         (ISOLATED, [(header::CONTENT_TYPE, content_type), (header::ETAG, etag)], body).into_response()
     }
+}
+
+/// The SPA document with its one deployment-specific value filled in.
+fn document(prefix: &str) -> Vec<u8> {
+    let index = index();
+    let source = index.data.as_ref();
+    let start = source
+        .windows(BASE_HREF.len())
+        .position(|window| window == BASE_HREF)
+        .expect("frontend index has the base-path marker");
+    let directory = base_path::directory(prefix);
+    let mut rendered = Vec::with_capacity(source.len() + directory.len());
+    rendered.extend_from_slice(&source[..start]);
+    rendered.extend_from_slice(b"<base href=\"");
+    rendered.extend_from_slice(directory.as_bytes());
+    rendered.push(b'\"');
+    rendered.extend_from_slice(&source[start + BASE_HREF.len()..]);
+    rendered
 }
 
 /// The headers that make the page cross-origin isolated, for its threads.
@@ -106,6 +138,14 @@ const ISOLATED: [(header::HeaderName, HeaderValue); 2] = [
 fn etag(file: &EmbeddedFile) -> HeaderValue {
     let mut hex = String::with_capacity(64);
     for byte in file.metadata.sha256_hash() {
+        write!(hex, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    quoted(&hex)
+}
+
+fn bytes_etag(bytes: &[u8]) -> HeaderValue {
+    let mut hex = String::with_capacity(64);
+    for byte in Sha256::digest(bytes) {
         write!(hex, "{byte:02x}").expect("writing to a String cannot fail");
     }
     quoted(&hex)
@@ -142,7 +182,23 @@ mod tests {
         path: &str,
         if_none_match: Option<&HeaderValue>,
     ) -> Response {
+        request(decoder, path, None, if_none_match)
+    }
+
+    fn get_prefixed(path: &str, prefix: &str, if_none_match: Option<&HeaderValue>) -> Response {
+        request(None, path, Some(prefix), if_none_match)
+    }
+
+    fn request(
+        decoder: Option<&HevcDecoder>,
+        path: &str,
+        prefix: Option<&str>,
+        if_none_match: Option<&HeaderValue>,
+    ) -> Response {
         let mut request = Request::builder().uri(path);
+        if let Some(prefix) = prefix {
+            request = request.header(base_path::FORWARDED_PREFIX, prefix);
+        }
         if let Some(held) = if_none_match {
             request = request.header(header::IF_NONE_MATCH, held);
         }
@@ -165,7 +221,9 @@ mod tests {
             "text/html; charset=utf-8"
         );
         let index = body(response).await;
+        assert!(index.contains("<base href=\"/\""), "{index}");
         assert!(index.contains("<div id=\"root\">"), "{index}");
+        assert!(index.contains("./assets/"), "bundle URLs must be relative: {index}");
 
         let script = Frontend::iter()
             .find(|name| name.starts_with("assets/") && name.ends_with(".js"))
@@ -181,6 +239,24 @@ mod tests {
             .expect("the bundle has a stylesheet");
         let response = get(&format!("/{stylesheet}"), None);
         assert_eq!(response.headers()[header::CONTENT_TYPE], "text/css; charset=utf-8");
+    }
+
+    /// The same document is rooted at a validated proxy mount, including an SPA
+    /// route, and its validator belongs to that rendered document.
+    #[tokio::test]
+    async fn the_document_base_follows_the_forwarded_prefix() {
+        let root = get("/", None);
+        let root_etag = root.headers()[header::ETAG].clone();
+        let nested = get_prefixed("/display/2", "/apps/remotex/", None);
+        assert_eq!(nested.status(), StatusCode::OK);
+        assert_ne!(nested.headers()[header::ETAG], root_etag);
+        let nested_etag = nested.headers()[header::ETAG].clone();
+        let html = body(nested).await;
+        assert!(html.contains("<base href=\"/apps/remotex/\""), "{html}");
+        assert!(!html.contains("<base href=\"/\""), "{html}");
+
+        let held = get_prefixed("/display/2", "/apps/remotex", Some(&nested_etag));
+        assert_eq!(held.status(), StatusCode::NOT_MODIFIED);
     }
 
     /// The document, a script a worker may start from, and a revalidation of

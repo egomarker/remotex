@@ -168,11 +168,13 @@ passed.
   to try out a use case; one stays maintained only while its benefits justify a
   separate client.
 - There is one frontend build, compiled from Cargo's `OUT_DIR` into the gateway
-  binary (`src/assets.rs`) and served from its origin root. A standalone build
-  and the release artifact use `frontend/dist`; a Cargo build produces the same
-  bundle privately or stages that artifact. Do not add a web root, a
-  `static_dir`, or any run-time path the SPA is read from. Every URL the page
-  uses goes through `frontend/src/gateway.ts`.
+  binary (`src/assets.rs`) and served from its origin root or from one reverse-proxy
+  mount. A standalone build and the release artifact use `frontend/dist`; a Cargo
+  build produces the same bundle privately or stages that artifact. The document's
+  base names the validated public mount, so the same bundle serves either shape;
+  do not make a deployment-specific build. Do not add a web root, a `static_dir`,
+  or any run-time path the SPA is read from. Every URL the page uses goes through
+  `frontend/src/gateway.ts`.
 - The bundle holds two WebAssembly modules, each a directory of its own under
   `frontend/wasm` and built by the frontend's build for
   `wasm32-unknown-unknown`. `frontend/wasm/egfx` is the compositor, around
@@ -2866,6 +2868,17 @@ private endpoint — `<instance>/gateway.sock`, or a named pipe on Windows — a
 never on TCP, and the thing terminating the proxy is the TUI master, which the
 browser reaches over loopback TCP and which forwards each connection to that
 endpoint.
+
+A reverse proxy may publish the gateway at `/` or at any path such as
+`/apps/remotex/`. For a path mount it strips that prefix before forwarding and
+replaces (never appends to) `X-Forwarded-Prefix` with the public path on every
+HTTP request and WebSocket upgrade. The value is a slash-led sequence of
+unreserved path segments; one trailing slash is accepted, and a malformed or
+multiple value is a 400 rather than an origin-root fallback. The gateway uses it
+for the document base, its development-host redirect and the `remotex_session`
+cookie path. A TLS terminator also sets `X-Forwarded-Proto: https`. A proxy with
+an authentication cookie of its own must not pass that cookie upstream: forward
+only the explicitly allowed `remotex_session` cookie the gateway needs.
 
 `[branding]` is a top-level table rather than `[server]` keys: it names the
 deployment rather than the server, and one value with two spellings is one of

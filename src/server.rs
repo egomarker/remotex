@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use crate::auth::GatewayAuth;
 use crate::{
     auth::{self, AuthSessions},
+    base_path,
     config::AppConfig,
     error::{ApiResult, AppError},
     hevc_wasm::HevcDecoder,
@@ -327,15 +328,29 @@ pub(crate) fn router_with_sessions(
         .fallback(|State(state): State<AppState>, request: Request| async move {
             crate::assets::serve(state.hevc_decoder.as_ref(), &request)
         })
-        // Added last and therefore **outermost**: it sees every request before
-        // routing, because what it acts on is the `Host` a browser arrived under
-        // rather than which handler would answer. Inert unless
-        // `[server].dev_subdomain` is set and that host is loopback.
+        // The development-host redirect sees every request before routing because
+        // what it acts on is the `Host`, not which handler would answer.
         .layer(middleware::from_fn_with_state(
             state.clone(),
             dev_hostname_redirect,
         ))
+        // Added last and therefore outermost. A malformed forwarded prefix must
+        // fail before an API handler can broaden a cookie to `/`, or the SPA can
+        // emit URLs outside the mount the proxy intended.
+        .layer(middleware::from_fn(validate_forwarded_prefix))
         .with_state(state)
+}
+
+/// Refuse a present `X-Forwarded-Prefix` unless it is one canonical path.
+///
+/// Absence is the ordinary origin-root deployment. The value is supplied by a
+/// trusted reverse proxy and parsed again where it is used; this outer guard is
+/// what makes every such use infallible.
+async fn validate_forwarded_prefix(req: Request, next: Next) -> Response {
+    if base_path::forwarded_prefix(req.headers()).is_err() {
+        return (StatusCode::BAD_REQUEST, "invalid x-forwarded-prefix\n").into_response();
+    }
+    next.run(req).await
 }
 
 /// Whether `name` — a `Host` header with its port and brackets already stripped —
@@ -426,11 +441,15 @@ async fn dev_hostname_redirect(State(state): State<AppState>, req: Request, next
         Some(port) => format!("{dev_hostname}:{port}"),
         None => dev_hostname.to_owned(),
     };
+    let prefix = base_path::forwarded_prefix(req.headers())
+        .expect("the outer prefix middleware validated this request");
+    let path_and_query = req
+        .uri()
+        .path_and_query()
+        .map_or("/", |path_and_query| path_and_query.as_str());
     let target = format!(
         "http://{authority}{}",
-        req.uri()
-            .path_and_query()
-            .map_or("/", |path_and_query| path_and_query.as_str())
+        base_path::public_path(prefix, path_and_query)
     );
     match header::HeaderValue::from_str(&target) {
         Ok(location) => {
@@ -490,20 +509,28 @@ fn authenticate(state: &AppState, headers: &HeaderMap) -> bool {
     state.config.auth.authenticates(&state.auth, &presented)
 }
 
-/// `Set-Cookie` attributes for the session cookie. `Secure` cookies set over
-/// plain HTTP are silently dropped by Safari (even on localhost, unlike
-/// Chrome), so the flag is only added when the request actually arrived over
-/// HTTPS — which, since this server only speaks HTTP, means via a
+/// `Set-Cookie` attributes for the session cookie. Its path is the validated
+/// public mount, not the upstream router's `/`, so sibling applications on a
+/// shared origin never receive it.
+///
+/// `Secure` cookies set over plain HTTP are silently dropped by Safari (even on
+/// localhost, unlike Chrome), so the flag is only added when the request actually
+/// arrived over HTTPS — which, since this server only speaks HTTP, means via a
 /// TLS-terminating proxy setting `x-forwarded-proto`.
-fn cookie_flags(headers: &HeaderMap) -> &'static str {
-    let https = headers
+fn cookie_flags(headers: &HeaderMap) -> String {
+    let prefix = base_path::forwarded_prefix(headers)
+        .expect("the outer prefix middleware validated this request");
+    let mut flags = format!(
+        "HttpOnly; SameSite=Strict; Path={}",
+        base_path::directory(prefix)
+    );
+    if headers
         .get("x-forwarded-proto")
-        .is_some_and(|proto| proto.as_bytes() == b"https");
-    if https {
-        "HttpOnly; SameSite=Strict; Path=/; Secure"
-    } else {
-        "HttpOnly; SameSite=Strict; Path=/"
+        .is_some_and(|proto| proto.as_bytes() == b"https")
+    {
+        flags.push_str("; Secure");
     }
+    flags
 }
 
 #[derive(Deserialize)]
@@ -1111,16 +1138,25 @@ mod tests {
     /// The `Location` a `GET /` under `host` is sent to, or `None` when it was
     /// not redirected at all.
     async fn redirect_for(router: Router, host: &str, path: &str) -> Option<String> {
+        redirect_for_with_prefix(router, host, path, None).await
+    }
+
+    async fn redirect_for_with_prefix(
+        router: Router,
+        host: &str,
+        path: &str,
+        prefix: Option<&str>,
+    ) -> Option<String> {
         use tower::ServiceExt as _;
 
+        let mut request = axum::http::Request::builder()
+            .uri(path)
+            .header(header::HOST, host);
+        if let Some(prefix) = prefix {
+            request = request.header(base_path::FORWARDED_PREFIX, prefix);
+        }
         let response = router
-            .oneshot(
-                axum::http::Request::builder()
-                    .uri(path)
-                    .header(header::HOST, host)
-                    .body(axum::body::Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(request.body(axum::body::Body::empty()).unwrap())
             .await
             .unwrap();
         if response.status() != StatusCode::TEMPORARY_REDIRECT {
@@ -1198,6 +1234,22 @@ mod tests {
         assert_eq!(
             redirect_for(dev_router(Some("gw-a.remotex.localhost")), "localhost", "/").await,
             Some("http://gw-a.remotex.localhost/".to_owned())
+        );
+    }
+
+    /// A proxy mount remains on the redirect: the browser-visible path, not the
+    /// stripped path this router received, is what belongs in `Location`.
+    #[tokio::test]
+    async fn the_dev_hostname_redirect_keeps_the_forwarded_prefix() {
+        assert_eq!(
+            redirect_for_with_prefix(
+                dev_router(Some("gw-a.remotex.localhost")),
+                "127.0.0.1:52675",
+                "/?next=1",
+                Some("/apps/remotex/"),
+            )
+            .await,
+            Some("http://gw-a.remotex.localhost:52675/apps/remotex/?next=1".to_owned())
         );
     }
 
@@ -1436,6 +1488,99 @@ mod tests {
         println!("  Ctrl-C when done; this waits 15 minutes.\n");
         std::io::stdout().flush().unwrap();
         tokio::time::sleep(std::time::Duration::from_secs(900)).await;
+    }
+
+    /// Login and logout scope the browser credential to the public mount, and
+    /// keep the HTTPS proxy flag beside it.
+    #[tokio::test]
+    async fn auth_cookies_follow_the_forwarded_prefix() {
+        use tower::ServiceExt as _;
+
+        for (prefix, path, secure) in [
+            (None, "Path=/", false),
+            (Some("/apps/remotex/"), "Path=/apps/remotex/", true),
+            (Some("/tools/remote"), "Path=/tools/remote/", false),
+        ] {
+            let app = router(router_config(None), Throughput::default(), None);
+            let mut login = axum::http::Request::builder()
+                .method("POST")
+                .uri("/api/auth/login")
+                .header(header::CONTENT_TYPE, "application/json");
+            if let Some(prefix) = prefix {
+                login = login.header(base_path::FORWARDED_PREFIX, prefix);
+            }
+            if secure {
+                login = login.header("x-forwarded-proto", "https");
+            }
+            let response = app
+                .clone()
+                .oneshot(
+                    login
+                        .body(axum::body::Body::from(
+                            r#"{"username":"admin","password":"hunter2"}"#,
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let set = response
+                .headers()
+                .get(header::SET_COOKIE)
+                .unwrap()
+                .to_str()
+                .unwrap();
+            assert!(set.contains(path), "{set}");
+            assert_eq!(set.contains("; Secure"), secure, "{set}");
+            let cookie = set.split(';').next().unwrap();
+
+            let mut logout = axum::http::Request::builder()
+                .method("POST")
+                .uri("/api/auth/logout")
+                .header(header::COOKIE, cookie);
+            if let Some(prefix) = prefix {
+                logout = logout.header(base_path::FORWARDED_PREFIX, prefix);
+            }
+            if secure {
+                logout = logout.header("x-forwarded-proto", "https");
+            }
+            let response = app
+                .clone()
+                .oneshot(logout.body(axum::body::Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let cleared = response
+                .headers()
+                .get(header::SET_COOKIE)
+                .unwrap()
+                .to_str()
+                .unwrap();
+            assert!(cleared.contains(path), "{cleared}");
+            assert!(cleared.contains("Max-Age=0"), "{cleared}");
+        }
+    }
+
+    /// A present malformed prefix fails closed before a public route, an auth
+    /// handler, or the SPA fallback can interpret it as an origin-root mount.
+    #[tokio::test]
+    async fn malformed_forwarded_prefixes_are_bad_requests() {
+        use tower::ServiceExt as _;
+
+        let app = router(router_config(None), Throughput::default(), None);
+        for prefix in ["apps/remotex", "/apps//remotex", "/apps/../remotex", "/apps?other=1"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri("/api/config")
+                        .header(base_path::FORWARDED_PREFIX, prefix)
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{prefix:?}");
+        }
     }
 
     /// The exact `/api/targets` entry. Pinned because the picker reads every key
