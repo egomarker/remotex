@@ -1,10 +1,8 @@
 // The gate every other file in this client depends on not having to check.
 //
 // Worth its own test precisely because nothing else tests it: once this returns true
-// the rest of the client assumes a secure context and a pair of WebCodecs decoders
-// everywhere, with no branch left to exercise. If it ever returned true without them
-// the failure would surface as the clipboard, the keyboard, the picture and the sound
-// going missing separately, which is the state this exists to make impossible.
+// the rest of the client assumes a secure context and a WebCodecs video decoder.
+// Audio is optional; its existing failure path leaves the desktop running silently.
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
@@ -101,24 +99,27 @@ test("an insecure context refuses, and says where and how", () => {
   assert.equal(root.children[0]?.className, "boot-refusal");
 });
 
-test("a missing decoder refuses, and names which one", () => {
-  for (const missing of ["VideoDecoder", "AudioDecoder"] as const) {
-    capable();
-    globals[missing] = undefined;
-    const root = element("div");
+test("a missing video decoder refuses and names it", () => {
+  capable();
+  globals.VideoDecoder = undefined;
+  const root = element("div");
 
-    assert.equal(startupPermitted(asRoot(root)), false, missing);
-    const rendered = text(root);
-    assert.match(rendered, /WebCodecs/);
-    assert.match(
-      rendered,
-      missing === "VideoDecoder" ? /\bvideo\b/ : /\baudio\b/,
-      `${missing} went missing and the message did not say so`,
-    );
-  }
+  assert.equal(startupPermitted(asRoot(root)), false);
+  const rendered = text(root);
+  assert.match(rendered, /WebCodecs/);
+  assert.match(rendered, /\bvideo\b/);
 });
 
-test("a browser with neither decoder is told about both, once", () => {
+test("a missing audio decoder permits a video-only client", () => {
+  capable();
+  globals.AudioDecoder = undefined;
+  const root = element("div");
+
+  assert.equal(startupPermitted(asRoot(root)), true);
+  assert.equal(root.children.length, 0);
+});
+
+test("a browser with neither decoder is refused for its missing video decoder", () => {
   capable();
   globals.VideoDecoder = undefined;
   globals.AudioDecoder = undefined;
@@ -126,7 +127,7 @@ test("a browser with neither decoder is told about both, once", () => {
 
   assert.equal(startupPermitted(asRoot(root)), false);
   const rendered = text(root);
-  assert.match(rendered, /video or audio/);
+  assert.match(rendered, /\bvideo\b/);
   // Not the origin: the address is the one thing that is fine here, and naming it
   // sends the reader to fix the deployment instead of the browser.
   assert.ok(!rendered.includes("http://10.0.0.4:52380"));
